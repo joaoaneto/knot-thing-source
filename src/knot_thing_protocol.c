@@ -73,9 +73,11 @@ static knot_msg msg;
 static struct nrf24_config config = { .mac = 0, .channel = 76 , .name = NULL};
 static unsigned long clear_time;
 static uint32_t last_timeout;
+static uint32_t unreg_timeout;
 static int sock = -1;
 static int cli_sock = -1;
 static bool schema_flag = false;
+static bool unreg_flag = false;
 static uint8_t enable_run = 0, msg_sensor_id = 0;
 
 /*
@@ -92,6 +94,19 @@ static void set_nrf24MAC(void)
 						sizeof(struct nrf24_mac));
 }
 
+static void thing_disconnect_exit(void)
+{
+	/* reset EEPROM (UUID/Token) and generate new MAC addr */
+	hal_storage_reset_end();
+	set_nrf24MAC();
+
+	/* close connection */
+	knot_thing_protocol_exit();
+
+	/* reset thing */
+	reset_function();
+}
+
 static void verify_clear_data(void)
 {
 	if (!hal_gpio_digital_read(CLEAR_EEPROM_PIN)) {
@@ -100,16 +115,7 @@ static void verify_clear_data(void)
 			clear_time = hal_time_ms();
 
 		if (hal_timeout(hal_time_ms(), clear_time, BUTTON_PRESSED_TIME)) {
-			/* close connection */
-			knot_thing_protocol_exit();
-
-			/* generate new MAC addr */
-			hal_storage_reset_end();
-			set_nrf24MAC();
-
-			/* reset thing */
-			reset_function();
-
+			thing_disconnect_exit();
 		}
 	} else
 		clear_time = 0;
@@ -223,23 +229,22 @@ static void led_status(uint8_t status)
 	}
 }
 
-static void handle_unregister(void) {
+
+
+static int send_unregister(void)
+{
 	/* send KNOT_MSG_UNREGISTER_RESP message */
 	msg.hdr.type = KNOT_MSG_UNREGISTER_RESP;
-	msg.action.result = KNOT_SUCCESS;
-	msg.hdr.payload_len = sizeof(msg.action.result);
-	hal_comm_write(cli_sock, &(msg.buffer),
-			sizeof(msg.hdr) + msg.hdr.payload_len);
+	msg.hdr.payload_len = 0;
 
-	/* reset EEPROM (UUID/Token) and generate new MAC addr */
-	hal_storage_reset_end();
-	set_nrf24MAC();
+	if(hal_comm_write(cli_sock, &(msg.buffer),
+			sizeof(msg.hdr) + msg.hdr.payload_len) < 0)
+		return -1;
 
-	/* close connection */
-	knot_thing_protocol_exit();
+	unreg_timeout = hal_time_ms();
+	unreg_flag = true;
 
-	/* reset thing */
-	reset_function();
+	return 0;
 }
 
 static int send_register(void)
@@ -274,7 +279,7 @@ static int read_register(void)
 		return nbytes;
 
 	if (msg.hdr.type == KNOT_MSG_UNREGISTER_REQ) {
-		handle_unregister();
+		send_unregister();
 		return -1;
 	}
 
@@ -300,7 +305,7 @@ static int read_auth(void)
 		return nbytes;
 
 	if (msg.hdr.type == KNOT_MSG_UNREGISTER_REQ) {
-		handle_unregister();
+		send_unregister();
 		return -1;
 	}
 
@@ -450,11 +455,9 @@ static void read_online_messages(void)
 			msg_get_data(msg.item.sensor_id);
 		}
 		break;
-
 	case KNOT_MSG_UNREGISTER_REQ:
-		handle_unregister();
+		send_unregister();
 		break;
-
 	default:
 		/* Invalid command, ignore */
 		break;
@@ -481,6 +484,9 @@ int knot_thing_protocol_run(void)
 		if (mgmt_read() == -ENOTCONN)
 			run_state = STATE_DISCONNECTED;
 	}
+
+	if (unreg_flag && hal_timeout(hal_time_ms(), unreg_timeout, 10000) > 0)
+		thing_disconnect_exit();
 
 	/* Network message handling state machine */
 	switch (run_state) {
@@ -620,7 +626,7 @@ int knot_thing_protocol_run(void)
 		hal_log_str("SCH_R");
 		if (hal_comm_read(cli_sock, &(msg.buffer), KNOT_MSG_SIZE) > 0) {
 			if (msg.hdr.type == KNOT_MSG_UNREGISTER_REQ) {
-				handle_unregister();
+				send_unregister();
 				break;
 			}
 			if (msg.hdr.type != KNOT_MSG_SCHEMA_RESP &&
@@ -659,7 +665,6 @@ int knot_thing_protocol_run(void)
 			hal_log_str("RUN");
 		}
 		break;
-
 	case STATE_RUNNING:
 		led_status(BLINK_ONLINE);
 		read_online_messages();
@@ -675,7 +680,6 @@ int knot_thing_protocol_run(void)
 			}
 		}
 		break;
-
 	case STATE_ERROR:
 		hal_gpio_digital_write(PIN_LED_STATUS, 1);
 		hal_log_str("ERR");
@@ -683,7 +687,6 @@ int knot_thing_protocol_run(void)
 		run_state = STATE_DISCONNECTED;
 		hal_delay_ms(1000);
 		break;
-
 	default:
 		hal_log_str("INV");
 		run_state = STATE_DISCONNECTED;
